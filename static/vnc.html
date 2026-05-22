@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>浏览器实时画面</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;padding:0;overflow:hidden;background:#111}
+#screen{
+  width:100%;height:100%;
+  display:flex;align-items:stretch;justify-content:stretch;
+}
+/* 强制 canvas 铺满 */
+#screen canvas{
+  width:100% !important;height:100% !important;
+  object-fit:contain;
+}
+#status{
+  position:fixed;top:12px;left:50%;transform:translateX(-50%);
+  padding:6px 18px;border-radius:8px;font-size:12px;color:#ccc;
+  background:rgba(0,0,0,.75);z-index:10;font-family:monospace;
+  pointer-events:none;transition:opacity .5s;
+}
+#status.ok{color:#4ade80}
+#toast{
+  position:fixed;bottom:60px;left:50%;transform:translateX(-50%);
+  padding:6px 16px;border-radius:8px;font-size:11px;color:#fff;
+  background:#059669;z-index:20;font-family:monospace;
+  pointer-events:none;opacity:0;transition:opacity .2s;
+}
+#toast.show{opacity:1}
+#pastebox{
+  position:fixed;top:-500px;left:-500px;width:1px;height:1px;
+  opacity:0;pointer-events:none;
+}
+</style>
+<script type="importmap">
+{"imports":{"@novnc/novnc/":"/static/novnc/"}}
+</script>
+</head>
+<body>
+<div id="screen"></div>
+<textarea id="pastebox"></textarea>
+<div id="status">正在加载...</div>
+<div id="toast"></div>
+
+<script type="module">
+import RFB from '@novnc/novnc/core/rfb.js';
+
+const st=document.getElementById('status');
+const toast=document.getElementById('toast');
+const pastebox=document.getElementById('pastebox');
+const scr=document.getElementById('screen');
+
+function flash(m){toast.textContent=m;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1600)}
+
+const params=new URLSearchParams(location.search);
+const sid=params.get('session_id')||'';
+const wsUrl=(location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/api/vnc/ws?session_id='+sid;
+
+const rfb=new RFB(scr, wsUrl, {});
+rfb.viewOnly=false;
+rfb.scaleViewport=true;
+rfb.resizeSession=true;
+rfb.clipViewport=false;
+rfb.focusOnClick=true;
+
+rfb.addEventListener('connect',()=>{
+  st.textContent='已连接 — 点击画面操作 · Ctrl+V 粘贴';
+  st.className='ok';
+  setTimeout(()=>{st.style.opacity='0'},3000);
+});
+rfb.addEventListener('disconnect',(e)=>{
+  st.textContent='断开: '+(e.detail?.reason||'未知');
+  st.className='';st.style.opacity='1';
+});
+
+// 远程 → 本地
+rfb.addEventListener('clipboard',(e)=>{
+  const t=e.detail?.text;
+  if(!t)return;
+  pastebox.value=t;pastebox.select();
+  try{document.execCommand('copy');flash('已复制')}catch(ex){}
+  if(navigator.clipboard?.writeText)navigator.clipboard.writeText(t).catch(()=>{});
+});
+
+// 直接用内部键盘发 Ctrl+V（一次，不带多余字符）
+function sendOneCtrlV() {
+  const kbd = rfb._keyboard;
+  if (!kbd) return;
+  const now = Date.now();
+  const mk = (type) => ({
+    type, key:'v', code:'KeyV',
+    ctrlKey:true, altKey:false, shiftKey:false, metaKey:false,
+    repeat:false, timeStamp:now, isComposing:false, location:0,
+    preventDefault:()=>{}, stopPropagation:()=>{},
+    getModifierState:(m)=>m==='Control',
+  });
+  kbd._handleKeyDown(mk('keydown'));
+  kbd._handleKeyUp(mk('keyup'));
+}
+
+// ==== Ctrl+V 粘贴（完整拦截，不泄漏给 noVNC）====
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey && e.key==='v' && !e.repeat)) return;
+
+  // 完全拦截，不让 noVNC 收到（我们后面手动发）
+  e.stopImmediatePropagation();
+  e.preventDefault();
+
+  pastebox.focus();
+  pastebox.value='';
+
+  const onPaste = (pe) => {
+    pastebox.removeEventListener('paste', onPaste);
+    const text = (pe.clipboardData||{}).getData('text/plain') || pastebox.value;
+    if (text) {
+      rfb.clipboardPasteFrom(text);
+      flash('已粘贴: '+text.substring(0,35)+(text.length>35?'...':''));
+      // 只发一次 Ctrl+V（确保剪贴板已同步）
+      setTimeout(() => sendOneCtrlV(), 150);
+    } else {
+      flash('未检测到剪贴板，请先 Ctrl+C 复制');
+    }
+    pastebox.value='';
+    // 焦点回到画面
+    setTimeout(() => scr.focus(), 50);
+  };
+
+  pastebox.addEventListener('paste', onPaste);
+  setTimeout(() => { pastebox.removeEventListener('paste', onPaste); }, 1000);
+
+}, {capture: true});
+
+// ==== 右键粘贴 ====
+scr.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  pastebox.focus();
+  pastebox.value='';
+  const onPaste = (pe) => {
+    if (pe.target !== pastebox) return;
+    pastebox.removeEventListener('paste', onPaste);
+    const text = (pe.clipboardData||{}).getData('text/plain') || pastebox.value;
+    if (text) {
+      rfb.clipboardPasteFrom(text);
+      flash('已粘贴: '+text.substring(0,35)+(text.length>35?'...':''));
+      setTimeout(() => sendOneCtrlV(), 150);
+    }
+    pastebox.value='';
+    setTimeout(() => scr.focus(), 50);
+  };
+  pastebox.addEventListener('paste', onPaste);
+  setTimeout(() => pastebox.removeEventListener('paste', onPaste), 1000);
+});
+
+// 点击画面聚焦
+scr.addEventListener('click',()=>{scr.focus();st.style.opacity='0'});
+</script>
+</body>
+</html>
